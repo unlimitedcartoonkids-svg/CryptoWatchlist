@@ -1,0 +1,11 @@
+python-binance
+python-telegram-bot
+Flask
+aiohttp
+numpy
+python-dotenv
+supabase
+telegram
+python-dateutil
+binance-connector
+binance
