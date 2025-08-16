@@ -1,11 +1,14 @@
-# analysis.py
-
 import numpy as np
-from typing import List, Tuple, Dict, Optional, Any
+from typing import List, Tuple, Dict, Optional
 from datetime import datetime
 
-# ===================== Numeric helpers & Indicators =====================
+from config_and_utils import logger, cooldown_ok
+from data_api import (
+    fetch_intervals, parse_ohlcv, get_klines,
+    get_hist_win_rates
+)
 
+# ===================== Numeric helpers & Indicators =====================
 def np_safe(arr: List[float]) -> np.ndarray:
     return np.array(arr, dtype=float) if arr else np.array([], dtype=float)
 
@@ -14,9 +17,6 @@ def safe_mean(x: np.ndarray) -> float:
 
 def safe_std(x: np.ndarray) -> float:
     return float(np.std(x)) if x.size else 0.0
-
-def percentile(x: np.ndarray, p: float) -> float:
-    return float(np.percentile(x, p)) if x.size else 0.0
 
 def rsi_series(closes: List[float], length: int = 14) -> np.ndarray:
     closes_np = np_safe(closes)
@@ -75,6 +75,9 @@ def cvd_proxy(closes: List[float], volumes: List[float]) -> np.ndarray:
     delta_vol = sign * volumes_np
     return np.cumsum(delta_vol)
 
+def percentile(x: np.ndarray, p: float) -> float:
+    return float(np.percentile(x, p)) if x.size else 0.0
+
 def rel_volume(volumes: List[float], lookback=20) -> float:
     v = np_safe(volumes)
     if v.size < lookback + 1:
@@ -82,16 +85,6 @@ def rel_volume(volumes: List[float], lookback=20) -> float:
     last = v[-1]
     avg = safe_mean(v[-lookback-1:-1])
     return float(last / avg) if avg > 0 else 1.0
-
-def volatility_metric(closes: List[float], win=30):
-    closes_np = np_safe(closes)
-    if closes_np.size < win:
-        return 0.0
-    seg = closes_np[-win:]
-    mu = float(np.mean(seg))
-    return float(np.std(seg) / mu) if mu else 0.0
-
-# ===================== Pattern & Signal Detection =====================
 
 def sell_side_liquidity_sweep_bullish(highs, lows, opens, closes, lookback=20):
     lows_np = np_safe(lows)
@@ -158,6 +151,14 @@ def cvd_imbalance_up(cvd: np.ndarray, bars=5, mult=1.6):
     if ref_std == 0:
         return bool(slope > 0)
     return bool(slope > mult * ref_std)
+
+def volatility_metric(closes: List[float], win=30):
+    closes_np = np_safe(closes)
+    if closes_np.size < win:
+        return 0.0
+    seg = closes_np[-win:]
+    mu = float(np.mean(seg))
+    return float(np.std(seg) / mu) if mu else 0.0
 
 # --- Bands & Squeeze ---
 def bbands(values: List[float], length=20, mult=2.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -242,8 +243,28 @@ def bullish_fvg_alert_logic(opens, highs, lows, closes, volumes, tf_label: str):
             return f"Bullish FVG Confirmed ({tf_label})"
     return None
 
-# ===================== Structure & Swing Logic =====================
+# ===================== Risk filters & HTF =====================
+def htf_bullish_bias(closes_1h: List[float], closes_4h: List[float]) -> bool:
+    if len(closes_1h) < 60:
+        return False
+    ema1h = ema_series(closes_1h, 50)
+    cond_1h = (closes_1h[-1] > ema1h[-1]) and (ema1h[-1] > ema1h[-6])
+    cond_4h = False
+    if len(closes_4h) >= 60:
+        ema4h = ema_series(closes_4h, 50)
+        cond_4h = (closes_4h[-1] > ema4h[-1]) and (ema4h[-1] > ema4h[-6])
+    return bool(cond_1h or cond_4h)
 
+def atr_vol_gate(highs_15, lows_15, closes_15):
+    atr15 = atr_series(highs_15, lows_15, closes_15, 14)
+    atr_slice = atr15[-100:] if atr15.size >= 100 else atr15
+    if atr_slice.size < 20:
+        return False
+    cur_atr = float(atr15[-1])
+    p40 = percentile(atr_slice, 40)
+    return bool(cur_atr >= p40 and cur_atr > 0)
+
+# ===================== Helper: structure/MSS/ChoCH =====================
 def swing_high_idx(highs: List[float], lookback=5) -> Optional[int]:
     h = np_safe(highs)
     if h.size < 2*lookback+1:
@@ -273,8 +294,7 @@ def broke_above_previous_swing_high(closes: List[float], highs: List[float], loo
             return bool(c[-1] > h[i])
     return False
 
-# ===================== Profile Functions =====================
-
+# ===================== Profiles =====================
 def profile_htf_sweep_mss_fvg(o1h,h1h,l1h,c1h,v1h,
                               o4h,h4h,l4h,c4h,v4h,
                               o15,h15,l15,c15,v15) -> Tuple[bool,List[str]]:
@@ -346,22 +366,160 @@ def profile_rs_breakout_vs_btc(c1h_coin: List[float], c1h_btc: List[float],
     ok = len(reasons) >= 1
     return ok, reasons
 
-def atr_vol_gate(highs_15, lows_15, closes_15):
-    atr15 = atr_series(highs_15, lows_15, closes_15, 14)
-    atr_slice = atr15[-100:] if atr15.size >= 100 else atr15
-    if atr_slice.size < 20:
-        return False
-    cur_atr = float(atr15[-1])
-    p40 = percentile(atr_slice, 40)
-    return bool(cur_atr >= p40 and cur_atr > 0)
+def profile_weekly_orb(o1h,h1h,l1h,c1h,v1h, now_utc: datetime) -> Tuple[bool,List[str]]:
+    # Placeholder kept same as original (not fully implemented there either)
+    return False, []
 
-def htf_bullish_bias(closes_1h: List[float], closes_4h: List[float]) -> bool:
-    if len(closes_1h) < 60:
-        return False
-    ema1h = ema_series(closes_1h, 50)
-    cond_1h = (closes_1h[-1] > ema1h[-1]) and (ema1h[-1] > ema1h[-6])
-    cond_4h = False
-    if len(closes_4h) >= 60:
-        ema4h = ema_series(closes_4h, 50)
-        cond_4h = (closes_4h[-1] > ema4h[-1]) and (ema4h[-1] > ema4h[-6])
-    return bool(cond_1h or cond_4h)
+# ===================== Opinion helper =====================
+def opinion_from_hist_win_rates(hw_rates: Dict[str, float]) -> Tuple[str, float]:
+    w = {"15m": 0.4, "1h": 0.35, "4h": 0.25}
+    num = sum(hw_rates.get(tf, 0.0) * w[tf] for tf in w)
+    den = sum(w.values())
+    agg = num / den if den else 0.0
+    if agg >= 70:
+        verdict = "🔥 Strong"
+    elif agg >= 55:
+        verdict = "✅ Moderate"
+    elif agg > 0:
+        verdict = "🟡 Weak"
+    else:
+        verdict = "⚪ No edge"
+    return verdict, agg
+
+# ===================== Volatility list (1H) =====================
+async def volatility_coin_list(get_exchange_info_func, get_klines_func, top_n: int = 20) -> List[Tuple[str, float]]:
+    exinfo = await get_exchange_info_func()
+    symbols = [
+        s["symbol"] for s in exinfo.get("symbols", [])
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+        and s.get("isSpotTradingAllowed", True)
+        and not any(x in s["symbol"] for x in ["UPUSDT","DOWNUSDT","BULLUSDT","BEARUSDT"])
+    ]
+
+    # local concurrency guard is handled by data_api; here we just fetch
+    async def vol_for(sym: str) -> Tuple[str,float]:
+        try:
+            k = await get_klines_func(sym, "1h", 180)
+            _,_,_,c,_,_ = parse_ohlcv(k)
+            v = volatility_metric(c, win=60)
+            return sym, v
+        except Exception:
+            return sym, 0.0
+
+    tasks = [vol_for(s) for s in symbols]
+    res = await __import__("asyncio").gather(*tasks)
+    res.sort(key=lambda x: x[1], reverse=True)
+    return res[:max(1, top_n)]
+
+# ===================== Detector (MTF) =====================
+async def detect_signals(symbol: str, btc_1h_cache: Optional[Dict[str,List[float]]] = None) -> Tuple[Dict[str, List[str]], Optional[str], Dict[str, float], List[str]]:
+    limits = {"15m": 240, "1h": 240, "4h": 240, "1d": 240}
+    data_map = await fetch_intervals(symbol, limits)
+    if any(len(data_map.get(iv, [])) == 0 for iv in ["15m", "1h"]):
+        return {}, None, {}, []
+
+    # OHLCV
+    o15,h15,l15,c15,v15,t15 = parse_ohlcv(data_map["15m"])
+    o1h,h1h,l1h,c1h,v1h,t1h = parse_ohlcv(data_map["1h"])
+    o4h,h4h,l4h,c4h,v4h,t4h = parse_ohlcv(data_map.get("4h", []))
+    o1d,h1d,l1d,c1d,v1d,t1d = parse_ohlcv(data_map.get("1d", []))
+
+    # Global gates
+    if not c1h or not c15:
+        return {}, None, {}, []
+    if not atr_vol_gate(h15,l15,c15):
+        return {}, None, {}, []
+    if not htf_bullish_bias(c1h, c4h):
+        return {}, None, {}, []
+
+    # Historical WR (edge gate)
+    hw_rates = await get_hist_win_rates(symbol)
+    verdict, agg = opinion_from_hist_win_rates(hw_rates)
+    if agg < 1.0:
+        return {}, None, hw_rates, []
+
+    # Short-TF 2-of-N rule
+    short_reasons = 0
+    if rel_volume(v15,20) >= 1.5: short_reasons += 1
+    if cvd_imbalance_up(cvd_proxy(c15,v15), bars=5, mult=1.4): short_reasons += 1
+    if whale_entry(v15,c15, factor=3.0): short_reasons += 1
+    if sell_side_liquidity_sweep_bullish(h15,l15,o15,c15,20): short_reasons += 1
+    if displacement_bullish(h15,l15,o15,c15, atr_series(h15,l15,c15,14), 0.55, 1.15): short_reasons += 1
+    if bullish_rsi_divergence(c15, rsi_series(c15,14), 25): short_reasons += 1
+    if short_reasons < 2:
+        return {}, None, hw_rates, []
+
+    # Profiles
+    profiles_triggered: List[str] = []
+    reasons_by_tf: Dict[str, List[str]] = {"15m": [], "1h": [], "4h": [], "1d": []}
+
+    ok1, r1 = profile_htf_sweep_mss_fvg(o1h,h1h,l1h,c1h,v1h, o4h,h4h,l4h,c4h,v4h, o15,h15,l15,c15,v15)
+    if ok1:
+        profiles_triggered.append("HTF Sweep→MSS→FVG+CVD")
+        reasons_by_tf["1h"].extend(r1)
+
+    ok2, r2 = profile_bullish_fvg_htf(o1h,h1h,l1h,c1h,v1h, o4h,h4h,l4h,c4h,v4h, o1d,h1d,l1d,c1d,v1d)
+    if ok2:
+        profiles_triggered.append("HTF Bullish FVG Reclaim")
+        for item in r2:
+            if "1D" in item:
+                reasons_by_tf["1d"].append(item)
+            elif "4H" in item:
+                reasons_by_tf["4h"].append(item)
+            else:
+                reasons_by_tf["1h"].append(item)
+
+    ok3, r3 = profile_squeeze_expansion(o1h,h1h,l1h,c1h,v1h)
+    if ok3:
+        profiles_triggered.append("Squeeze→Expansion (1H)")
+        reasons_by_tf["1h"].extend(r3)
+
+    # RS vs BTC
+    c1h_btc: List[float] = []
+    if btc_1h_cache and "BTCUSDT" in btc_1h_cache:
+        c1h_btc = btc_1h_cache["BTCUSDT"]
+    else:
+        btc_1h = await get_klines("BTCUSDT","1h",240)
+        _,_,_,c_btc,_,_ = parse_ohlcv(btc_1h)
+        c1h_btc = c_btc
+        if btc_1h_cache is not None:
+            btc_1h_cache["BTCUSDT"] = c1h_btc
+    ok4, r4 = profile_rs_breakout_vs_btc(c1h, c1h_btc, h1h, c15, h15)
+    if ok4:
+        profiles_triggered.append("RS Breakout vs BTC")
+        reasons_by_tf["1h"].extend(r4)
+
+    # Enrich 15m reasons
+    if cvd_imbalance_up(cvd_proxy(c15, v15), bars=5, mult=1.6):
+        reasons_by_tf["15m"].append("CVD Imbalance Up")
+    if whale_entry(v15, c15, factor=3.0):
+        reasons_by_tf["15m"].append("Whale Entry")
+    if sell_side_liquidity_sweep_bullish(h15, l15, o15, c15, 20):
+        reasons_by_tf["15m"].append("SSL Sweep")
+    if displacement_bullish(h15, l15, o15, c15, atr_series(h15,l15,c15,14), 0.6, 1.2):
+        reasons_by_tf["15m"].append("Smart Money Entry (Displacement)")
+    if bullish_rsi_divergence(c15, rsi_series(c15,14), 20):
+        reasons_by_tf["15m"].append("RSI Bullish Div")
+    if volatility_metric(c15, 30) > 0.5:
+        reasons_by_tf["15m"].append("High Volatility")
+
+    # HTF FVG confirm scan again (1h/4h/1d)
+    for tf, candles in [("1h", data_map.get("1h", [])), ("4h", data_map.get("4h", [])), ("1d", data_map.get("1d", []))]:
+        if not candles:
+            continue
+        o,h,lows,c,v,_ = parse_ohlcv(candles)
+        alert = bullish_fvg_alert_logic(o,h,lows,c,v,tf.upper())
+        if alert:
+            reasons_by_tf[tf].append("Bullish FVG Confirmed")
+
+    gate = (
+        (len(reasons_by_tf["15m"]) >= 3) or
+        (len(reasons_by_tf["1h"]) >= 2) or
+        any("Bullish FVG Confirmed" in x for x in reasons_by_tf["1h"] + reasons_by_tf["4h"] + reasons_by_tf["1d"])
+    )
+    if not gate or not cooldown_ok(symbol):
+        return {}, None, {}, []
+
+    final_text = f"{opinion_from_hist_win_rates(hw_rates)[0]} (Hist-Win Rate: {round(opinion_from_hist_win_rates(hw_rates)[1]):.0f}%). " \
+                 f"15m: {round(hw_rates.get('15m',0)):.0f}% | 1h: {round(hw_rates.get('1h',0)):.0f}% | 4h: {round(hw_rates.get('4h',0)):.0f}%"
+    return reasons_by_tf, final_text, hw_rates, profiles_triggered
